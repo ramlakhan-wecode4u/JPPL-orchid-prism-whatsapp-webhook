@@ -1,0 +1,13 @@
+{
+  "profiles": {
+    "JPPL.OrchidPrism.WhatsAppWebhook": {
+      "commandName": "Project",
+      "dotnetRunMessages": true,
+      "launchBrowser": true,
+      "applicationUrl": "https://localhost:52618;http://localhost:52619",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      }
+    }
+  }
+}
