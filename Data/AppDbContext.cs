@@ -9,9 +9,18 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<WhatsAppMessageLog> WhatsAppMessageLogs => Set<WhatsAppMessageLog>();
     public DbSet<WhatsAppApiSetting> WhatsAppApiSettings => Set<WhatsAppApiSetting>();
     public DbSet<Customer> Customers => Set<Customer>();
+    public DbSet<CustomerContact> CustomerContacts => Set<CustomerContact>();
     public DbSet<WhatsAppConversation> WhatsAppConversations => Set<WhatsAppConversation>();
     public DbSet<WhatsAppConversationMessage> WhatsAppConversationMessages => Set<WhatsAppConversationMessage>();
     public DbSet<WhatsAppMenuAction> WhatsAppMenuActions => Set<WhatsAppMenuAction>();
+
+    // Read-only tables owned by the main Orchid Prism project.
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<EstimateVersion> EstimateVersions => Set<EstimateVersion>();
+    public DbSet<LookupStatus> Statuses => Set<LookupStatus>();
+    public DbSet<CustomerBill> CustomerBills => Set<CustomerBill>();
+    public DbSet<CustomerBalance> CustomerBalances => Set<CustomerBalance>();
+    public DbSet<CustomerPaymentTerm> CustomerPaymentTerms => Set<CustomerPaymentTerm>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -52,6 +61,14 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.ToTable("Customers");
             entity.HasKey(item => item.Id);
             entity.Property(item => item.WhatsAppNumber).HasMaxLength(20);
+        });
+
+        modelBuilder.Entity<CustomerContact>(entity =>
+        {
+            entity.ToTable("CustomerContacts");
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.WhatsAppNumber).HasMaxLength(20);
+            entity.HasIndex(item => item.CustomerId);
         });
 
         modelBuilder.Entity<WhatsAppConversation>(entity =>
@@ -101,6 +118,48 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(item => item.NextState).HasMaxLength(100);
             entity.HasIndex(item => item.MenuKey);
             entity.HasIndex(item => item.ActionId);
+        });
+
+        modelBuilder.Entity<Order>(entity =>
+        {
+            entity.ToTable("Orders");
+            entity.HasKey(item => item.Id);
+        });
+
+        modelBuilder.Entity<EstimateVersion>(entity =>
+        {
+            entity.ToTable("EstimateVersions");
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.TotalPrice).HasPrecision(18, 2);
+        });
+
+        modelBuilder.Entity<LookupStatus>(entity =>
+        {
+            entity.ToTable("LuStatus");
+            entity.HasKey(item => item.Id);
+        });
+
+        modelBuilder.Entity<CustomerBill>(entity =>
+        {
+            entity.ToTable("CustomerBills");
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.TotalAmount).HasPrecision(18, 2);
+            entity.Property(item => item.PaidAmount).HasPrecision(18, 2);
+            entity.Property(item => item.OutstandingAmount).HasPrecision(18, 2);
+        });
+
+        modelBuilder.Entity<CustomerBalance>(entity =>
+        {
+            entity.ToTable("CustomerBalances");
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.BalanceAmount).HasPrecision(18, 2);
+        });
+
+        modelBuilder.Entity<CustomerPaymentTerm>(entity =>
+        {
+            entity.ToTable("CustomerPaymentTerms");
+            entity.HasKey(item => item.Id);
+            entity.Property(item => item.CreditLimit).HasPrecision(18, 2);
         });
     }
 }

@@ -1,7 +1,11 @@
 using JPPL.OrchidPrism.WhatsAppWebhook.Data;
+using JPPL.OrchidPrism.WhatsAppWebhook.Helpers;
 using JPPL.OrchidPrism.WhatsAppWebhook.Models;
+using JPPL.OrchidPrism.WhatsAppWebhook.Options;
 using JPPL.OrchidPrism.WhatsAppWebhook.Services;
+using System.Text;
 using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
 
 const long maxRequestBodySize = 1_048_576; // 1 MiB
 
@@ -16,8 +20,7 @@ var connectionString = builder.Configuration.GetConnectionString("DefaultConnect
 if (string.IsNullOrWhiteSpace(connectionString))
 {
     throw new InvalidOperationException(
-        "ConnectionStrings:DefaultConnection is required. Set it with the " +
-        "ConnectionStrings__DefaultConnection environment variable in production.");
+        "ConnectionStrings:DefaultConnection is required in appsettings.json.");
 }
 
 builder.WebHost.ConfigureKestrel(options =>
@@ -26,11 +29,26 @@ builder.WebHost.ConfigureKestrel(options =>
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(connectionString, sqlOptions =>
         sqlOptions.EnableRetryOnFailure(3)));
+builder.Services.AddHttpClient();
+builder.Services.AddSingleton<WhatsAppPayloadParser>();
+builder.Services.Configure<SupportContactOptions>(
+    builder.Configuration.GetSection(SupportContactOptions.SectionName));
+builder.Services.AddScoped<WhatsAppSignatureValidator>();
 builder.Services.AddScoped<WhatsAppWebhookProcessor>();
+builder.Services.AddScoped<WhatsAppAccountResolver>();
+builder.Services.AddScoped<CustomerAccountDataService>();
+builder.Services.AddScoped<WhatsAppMenuService>();
+builder.Services.AddScoped<WhatsAppMessageSender>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
+
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await DatabaseInitializer.EnsureWhatsAppMenuTablesAsync(db, app.Logger);
+}
 
 if (app.Environment.IsDevelopment())
 {
@@ -131,6 +149,39 @@ app.MapGet("/health", () => Results.Ok(new
 }))
 .WithName("HealthCheck");
 
+app.MapGet("/api/whatsapp/debug/database", async Task<IResult> (
+    AppDbContext db,
+    CancellationToken cancellationToken) =>
+{
+    var connection = db.Database.GetDbConnection();
+    var recentWebhookEvents = await db.WhatsAppWebhookEvents
+        .AsNoTracking()
+        .OrderByDescending(item => item.Id)
+        .Take(10)
+        .Select(item => new
+        {
+            item.Id,
+            item.EventType,
+            item.MetaMessageId,
+            item.WhatsAppNumber,
+            item.Processed,
+            item.ProcessingError,
+            item.CreatedAt,
+            item.ProcessedAt
+        })
+        .ToListAsync(cancellationToken);
+
+    return Results.Ok(new
+    {
+        database = connection.Database,
+        server = connection.DataSource,
+        webhookEventCount = await db.WhatsAppWebhookEvents.CountAsync(cancellationToken),
+        latestWebhookEvents = recentWebhookEvents
+    });
+})
+.WithName("WhatsAppDebugDatabase")
+.AddEndpointFilter(DevelopmentOnly);
+
 app.MapGet("/api/whatsapp/webhook", async Task<IResult> (
     HttpRequest request,
     AppDbContext db,
@@ -140,6 +191,7 @@ app.MapGet("/api/whatsapp/webhook", async Task<IResult> (
     var token = request.Query["hub.verify_token"].ToString();
     var challenge = request.Query["hub.challenge"].ToString();
 
+    // A browser hit has no Meta challenge values, so show a friendly page.
     if (string.IsNullOrWhiteSpace(mode) &&
         string.IsNullOrWhiteSpace(token) &&
         string.IsNullOrWhiteSpace(challenge))
@@ -204,9 +256,11 @@ app.MapGet("/api/whatsapp/webhook", async Task<IResult> (
             """, "text/html");
     }
 
+    // Meta verifies the webhook by sending back a challenge only when the configured token matches.
     var verifyToken = await db.WhatsAppApiSettings
         .AsNoTracking()
         .Where(setting => setting.IsActive)
+        .OrderByDescending(setting => setting.Id)
         .Select(setting => setting.VerifyToken)
         .FirstOrDefaultAsync(cancellationToken);
 
@@ -224,6 +278,7 @@ app.MapGet("/api/whatsapp/webhook", async Task<IResult> (
 app.MapPost("/api/whatsapp/webhook", async Task<IResult> (
     HttpRequest request,
     AppDbContext db,
+    WhatsAppSignatureValidator signatureValidator,
     WhatsAppWebhookProcessor processor,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
@@ -238,12 +293,24 @@ app.MapPost("/api/whatsapp/webhook", async Task<IResult> (
         return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
     }
 
-    string rawPayload;
-    using (var reader = new StreamReader(request.Body))
+    // The signature covers the exact bytes Meta sent, so read the body as bytes before decoding it.
+    byte[] body;
+    using (var buffer = new MemoryStream())
     {
-        rawPayload = await reader.ReadToEndAsync(cancellationToken);
+        await request.Body.CopyToAsync(buffer, cancellationToken);
+        body = buffer.ToArray();
     }
 
+    if (!await signatureValidator.IsValidAsync(
+            body,
+            request.Headers[WhatsAppSignatureValidator.SignatureHeaderName].ToString(),
+            cancellationToken))
+    {
+        logger.LogWarning("Rejected WhatsApp webhook request with a missing or invalid signature.");
+        return Results.Unauthorized();
+    }
+
+    var rawPayload = Encoding.UTF8.GetString(body);
     if (string.IsNullOrWhiteSpace(rawPayload))
     {
         return Results.BadRequest(new { error = "Request body is required." });
@@ -257,7 +324,7 @@ app.MapPost("/api/whatsapp/webhook", async Task<IResult> (
         CreatedAt = DateTime.UtcNow
     };
 
-    // This save deliberately happens before JSON parsing or message-log updates.
+    // Save RawPayload first so failed parsing/menu logic still leaves an audit trail for debugging.
     db.WhatsAppWebhookEvents.Add(webhookEvent);
     await db.SaveChangesAsync(cancellationToken);
 
@@ -298,13 +365,170 @@ app.MapPost("/api/whatsapp/webhook", async Task<IResult> (
         }
     }
 
+    // Meta should receive 200 after the raw payload is stored, even if internal processing failed.
     return Results.Ok();
 })
 .WithName("ReceiveWhatsAppWebhook");
 
+app.MapGet("/api/whatsapp/message-status/recent", async Task<IResult> (
+    AppDbContext db,
+    WhatsAppPayloadParser parser,
+    string? messageType,
+    int? take,
+    CancellationToken cancellationToken) =>
+{
+    var max = Math.Clamp(take ?? 10, 1, 50);
+    var query = db.WhatsAppMessageLogs.AsNoTracking()
+        .Where(log => log.Direction == "Outgoing");
+
+    if (!string.IsNullOrWhiteSpace(messageType))
+    {
+        query = query.Where(log => log.MessageType == messageType);
+    }
+
+    var logs = await query
+        .OrderByDescending(log => log.Id)
+        .Take(max)
+        .Select(log => new
+        {
+            log.Id,
+            log.CustomerId,
+            log.WhatsAppNumber,
+            log.MessageType,
+            log.TemplateName,
+            log.MetaMessageId,
+            log.Status,
+            log.ErrorCode,
+            log.ErrorMessage,
+            log.Payload,
+            log.ApiResponse,
+            log.CreatedAt,
+            log.UpdatedAt
+        })
+        .ToListAsync(cancellationToken);
+
+    var metaMessageIds = logs
+        .Select(log => log.MetaMessageId)
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Distinct()
+        .ToArray();
+
+    var webhookRows = await db.WhatsAppWebhookEvents.AsNoTracking()
+        .Where(item => item.MetaMessageId != null && metaMessageIds.Contains(item.MetaMessageId))
+        .OrderByDescending(item => item.Id)
+        .ToListAsync(cancellationToken);
+    var webhookEvents = webhookRows.Select(item => new
+    {
+        item.Id,
+        item.EventType,
+        item.MetaMessageId,
+        item.WhatsAppNumber,
+        item.Processed,
+        item.ProcessingError,
+        item.CreatedAt,
+        item.ProcessedAt,
+        Statuses = ExtractMatchingStatuses(parser, item.RawPayload, item.MetaMessageId)
+    });
+
+    return Results.Ok(new { logs, webhookEvents });
+})
+.WithName("RecentWhatsAppMessageStatus")
+.AddEndpointFilter(DevelopmentOnly);
+
+app.MapGet("/api/whatsapp/message-status/{metaMessageId}", async Task<IResult> (
+    string metaMessageId,
+    AppDbContext db,
+    WhatsAppPayloadParser parser,
+    CancellationToken cancellationToken) =>
+{
+    var logs = await db.WhatsAppMessageLogs.AsNoTracking()
+        .Where(log => log.MetaMessageId == metaMessageId)
+        .OrderByDescending(log => log.Id)
+        .Select(log => new
+        {
+            log.Id,
+            log.CustomerId,
+            log.WhatsAppNumber,
+            log.MessageType,
+            log.TemplateName,
+            log.MetaMessageId,
+            log.Status,
+            log.ErrorCode,
+            log.ErrorMessage,
+            log.Payload,
+            log.ApiResponse,
+            log.CreatedAt,
+            log.UpdatedAt
+        })
+        .ToListAsync(cancellationToken);
+
+    var webhookRows = await db.WhatsAppWebhookEvents.AsNoTracking()
+        .Where(item => item.MetaMessageId == metaMessageId ||
+                       item.RawPayload.Contains(metaMessageId))
+        .OrderByDescending(item => item.Id)
+        .ToListAsync(cancellationToken);
+    var webhookEvents = webhookRows.Select(item => new
+    {
+        item.Id,
+        item.EventType,
+        item.MetaMessageId,
+        item.WhatsAppNumber,
+        item.Processed,
+        item.ProcessingError,
+        item.CreatedAt,
+        item.ProcessedAt,
+        Statuses = ExtractMatchingStatuses(parser, item.RawPayload, metaMessageId)
+    });
+
+    return Results.Ok(new { metaMessageId, logs, webhookEvents });
+})
+.WithName("WhatsAppMessageStatusByMetaId")
+.AddEndpointFilter(DevelopmentOnly);
+
 app.Run();
+
+// Diagnostic endpoints expose phone numbers, payloads and database details, so they answer only in Development.
+static async ValueTask<object?> DevelopmentOnly(
+    EndpointFilterInvocationContext context,
+    EndpointFilterDelegate next) =>
+    context.HttpContext.RequestServices.GetRequiredService<IWebHostEnvironment>().IsDevelopment()
+        ? await next(context)
+        : Results.NotFound();
 
 static string Truncate(string value, int maximumLength) =>
     value.Length <= maximumLength ? value : value[..maximumLength];
+
+static IReadOnlyList<object> ExtractMatchingStatuses(
+    WhatsAppPayloadParser parser,
+    string rawPayload,
+    string? metaMessageId)
+{
+    if (string.IsNullOrWhiteSpace(metaMessageId))
+    {
+        return [];
+    }
+
+    try
+    {
+        return parser.Parse(rawPayload).Statuses
+            .Where(status => status.MetaMessageId == metaMessageId)
+            .Select(status => new
+            {
+                status.MetaMessageId,
+                status.Status,
+                status.RecipientId,
+                status.Timestamp,
+                status.ErrorCode,
+                status.ErrorMessage,
+                status.PayloadJson
+            })
+            .Cast<object>()
+            .ToList();
+    }
+    catch (JsonException)
+    {
+        return [];
+    }
+}
 
 public partial class Program;

@@ -1,142 +1,115 @@
-using System.Text.Json;
 using JPPL.OrchidPrism.WhatsAppWebhook.Data;
+using JPPL.OrchidPrism.WhatsAppWebhook.Helpers;
 using JPPL.OrchidPrism.WhatsAppWebhook.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace JPPL.OrchidPrism.WhatsAppWebhook.Services;
 
-public sealed class WhatsAppWebhookProcessor(AppDbContext db)
+public sealed class WhatsAppWebhookProcessor(
+    AppDbContext db,
+    WhatsAppPayloadParser parser,
+    WhatsAppMenuService menuService)
 {
     public async Task<WebhookMetadata> ProcessAsync(
         string rawPayload,
         CancellationToken cancellationToken)
     {
-        using var document = JsonDocument.Parse(rawPayload);
-        var root = document.RootElement;
-
-        var eventType = "unknown";
+        var parsedPayload = parser.Parse(rawPayload);
         string? firstMetaMessageId = null;
         string? firstWhatsAppNumber = null;
 
-        foreach (var value in EnumerateChangeValues(root))
+        foreach (var statusEvent in parsedPayload.Statuses)
         {
-            if (value.TryGetProperty("statuses", out var statuses) &&
-                statuses.ValueKind == JsonValueKind.Array)
-            {
-                eventType = "statuses";
-
-                foreach (var statusEvent in statuses.EnumerateArray())
-                {
-                    var metaMessageId = GetString(statusEvent, "id");
-                    var whatsAppNumber = GetString(statusEvent, "recipient_id");
-                    var status = MapStatus(GetString(statusEvent, "status"));
-
-                    firstMetaMessageId ??= metaMessageId;
-                    firstWhatsAppNumber ??= whatsAppNumber;
-
-                    if (string.IsNullOrWhiteSpace(metaMessageId) || status is null)
-                    {
-                        continue;
-                    }
-
-                    var messageLogs = await db.WhatsAppMessageLogs
-                        .Where(log => log.MetaMessageId == metaMessageId)
-                        .ToListAsync(cancellationToken);
-
-                    var (errorCode, errorMessage) = ReadError(statusEvent);
-                    foreach (var messageLog in messageLogs)
-                    {
-                        messageLog.Status = status;
-                        messageLog.UpdatedAt = DateTime.UtcNow;
-
-                        if (status == "Failed")
-                        {
-                            messageLog.ErrorCode = errorCode;
-                            messageLog.ErrorMessage = errorMessage;
-                        }
-                    }
-                }
-            }
-
-            if (value.TryGetProperty("messages", out var messages) &&
-                messages.ValueKind == JsonValueKind.Array)
-            {
-                if (eventType == "unknown")
-                {
-                    eventType = "messages";
-                }
-
-                foreach (var message in messages.EnumerateArray())
-                {
-                    var metaMessageId = GetString(message, "id");
-                    var whatsAppNumber = GetString(message, "from");
-                    firstMetaMessageId ??= metaMessageId;
-                    firstWhatsAppNumber ??= whatsAppNumber;
-
-                    if (string.IsNullOrWhiteSpace(metaMessageId))
-                    {
-                        continue;
-                    }
-
-                    var alreadyLogged = await db.WhatsAppMessageLogs
-                        .AnyAsync(log => log.MetaMessageId == metaMessageId &&
-                                         log.Direction == "Incoming", cancellationToken);
-
-                    if (!alreadyLogged)
-                    {
-                        db.WhatsAppMessageLogs.Add(new WhatsAppMessageLog
-                        {
-                            WhatsAppNumber = whatsAppNumber,
-                            MessageType = "IncomingMessage",
-                            MetaMessageId = metaMessageId,
-                            Direction = "Incoming",
-                            Status = "Received",
-                            Payload = rawPayload,
-                            CreatedAt = DateTime.UtcNow
-                        });
-                    }
-                }
-            }
-
-            if (eventType == "unknown" && HasNonEmptyArray(value, "errors"))
-            {
-                eventType = "errors";
-            }
+            firstMetaMessageId ??= statusEvent.MetaMessageId;
+            firstWhatsAppNumber ??= statusEvent.RecipientId;
+            await ProcessStatusEventAsync(statusEvent, cancellationToken);
         }
 
-        if (eventType == "unknown" && HasNonEmptyArray(root, "errors"))
+        foreach (var message in parsedPayload.Messages)
         {
-            eventType = "errors";
+            firstMetaMessageId ??= message.MetaMessageId;
+            firstWhatsAppNumber ??= message.From;
+            await LogIncomingMessageAsync(message, cancellationToken);
+            await menuService.ProcessIncomingMessageAsync(message, cancellationToken);
         }
 
-        return new WebhookMetadata(eventType, firstMetaMessageId, firstWhatsAppNumber);
+        return new WebhookMetadata(parsedPayload.EventType, firstMetaMessageId, firstWhatsAppNumber);
     }
 
-    private static IEnumerable<JsonElement> EnumerateChangeValues(JsonElement root)
+    private async Task ProcessStatusEventAsync(
+        ParsedStatusEvent statusEvent,
+        CancellationToken cancellationToken)
     {
-        if (!root.TryGetProperty("entry", out var entries) ||
-            entries.ValueKind != JsonValueKind.Array)
+        var status = MapStatus(statusEvent.Status);
+        if (string.IsNullOrWhiteSpace(statusEvent.MetaMessageId) || status is null)
         {
-            yield break;
+            return;
         }
 
-        foreach (var entry in entries.EnumerateArray())
+        var messageLogs = await db.WhatsAppMessageLogs
+            .Where(log => log.MetaMessageId == statusEvent.MetaMessageId)
+            .ToListAsync(cancellationToken);
+
+        foreach (var messageLog in messageLogs)
         {
-            if (!entry.TryGetProperty("changes", out var changes) ||
-                changes.ValueKind != JsonValueKind.Array)
+            // Meta can deliver status webhooks out of order; never move a message back,
+            // for example from Read to Delivered.
+            if (GetStatusRank(status) <= GetStatusRank(messageLog.Status))
             {
                 continue;
             }
 
-            foreach (var change in changes.EnumerateArray())
+            messageLog.Status = status;
+            messageLog.UpdatedAt = DateTime.UtcNow;
+
+            if (status == "Failed")
             {
-                if (change.TryGetProperty("value", out var value) &&
-                    value.ValueKind == JsonValueKind.Object)
-                {
-                    yield return value;
-                }
+                messageLog.ErrorCode = statusEvent.ErrorCode;
+                messageLog.ErrorMessage = statusEvent.ErrorMessage;
             }
         }
+
+        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    private static int GetStatusRank(string? status) => status switch
+    {
+        "Sent" => 1,
+        "Delivered" => 2,
+        "Read" => 3,
+        "Failed" => 4,
+        _ => 0
+    };
+
+    private async Task LogIncomingMessageAsync(
+        ParsedIncomingMessage message,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(message.MetaMessageId) ||
+            string.IsNullOrWhiteSpace(message.From))
+        {
+            return;
+        }
+
+        var alreadyLogged = await db.WhatsAppMessageLogs
+            .AnyAsync(log => log.MetaMessageId == message.MetaMessageId &&
+                             log.Direction == "Incoming", cancellationToken);
+
+        if (alreadyLogged)
+        {
+            return;
+        }
+
+        db.WhatsAppMessageLogs.Add(new WhatsAppMessageLog
+        {
+            WhatsAppNumber = message.From,
+            MessageType = "IncomingMessage",
+            MetaMessageId = message.MetaMessageId,
+            Direction = "Incoming",
+            Status = "Received",
+            Payload = message.PayloadJson,
+            CreatedAt = DateTime.UtcNow
+        });
     }
 
     private static string? MapStatus(string? status) => status?.ToLowerInvariant() switch
@@ -147,54 +120,6 @@ public sealed class WhatsAppWebhookProcessor(AppDbContext db)
         "failed" => "Failed",
         _ => null
     };
-
-    private static (string? Code, string? Message) ReadError(JsonElement statusEvent)
-    {
-        if (!statusEvent.TryGetProperty("errors", out var errors) ||
-            errors.ValueKind != JsonValueKind.Array ||
-            errors.GetArrayLength() == 0)
-        {
-            return (null, null);
-        }
-
-        var error = errors[0];
-        var code = GetValueAsString(error, "code");
-        var message = GetString(error, "message") ?? GetString(error, "title");
-
-        if (error.TryGetProperty("error_data", out var errorData) &&
-            errorData.ValueKind == JsonValueKind.Object)
-        {
-            message ??= GetString(errorData, "details");
-        }
-
-        return (code, message);
-    }
-
-    private static bool HasNonEmptyArray(JsonElement element, string propertyName) =>
-        element.TryGetProperty(propertyName, out var property) &&
-        property.ValueKind == JsonValueKind.Array &&
-        property.GetArrayLength() > 0;
-
-    private static string? GetString(JsonElement element, string propertyName) =>
-        element.TryGetProperty(propertyName, out var property) &&
-        property.ValueKind == JsonValueKind.String
-            ? property.GetString()
-            : null;
-
-    private static string? GetValueAsString(JsonElement element, string propertyName)
-    {
-        if (!element.TryGetProperty(propertyName, out var property))
-        {
-            return null;
-        }
-
-        return property.ValueKind switch
-        {
-            JsonValueKind.String => property.GetString(),
-            JsonValueKind.Number => property.GetRawText(),
-            _ => null
-        };
-    }
 }
 
 public sealed record WebhookMetadata(

@@ -21,8 +21,10 @@ public sealed class WhatsAppPayloadParser
                         GetString(status, "id"),
                         GetString(status, "status"),
                         GetString(status, "recipient_id"),
+                        GetString(status, "timestamp"),
                         ReadErrorCode(status),
-                        ReadErrorMessage(status)));
+                        ReadErrorMessage(status),
+                        status.GetRawText()));
                 }
             }
 
@@ -75,11 +77,20 @@ public sealed class WhatsAppPayloadParser
                 interactiveTitle = GetString(listReply, "title");
             }
         }
+        else if (type == "button" &&
+                 message.TryGetProperty("button", out var templateButton) &&
+                 templateButton.ValueKind == JsonValueKind.Object)
+        {
+            // Quick-reply buttons on template messages arrive as type "button" with the button text.
+            messageType = "TemplateButton";
+            userText = GetString(templateButton, "text");
+        }
 
         return new ParsedIncomingMessage(
             GetString(message, "from"),
             GetString(message, "id"),
             GetString(message, "timestamp"),
+            type,
             messageType,
             userText,
             interactiveId,
@@ -131,15 +142,24 @@ public sealed class WhatsAppPayloadParser
             return null;
         }
 
-        var message = GetString(error, "message") ?? GetString(error, "title");
-        if (message is null &&
-            error.TryGetProperty("error_data", out var errorData) &&
+        string? details = null;
+        if (error.TryGetProperty("error_data", out var errorData) &&
             errorData.ValueKind == JsonValueKind.Object)
         {
-            message = GetString(errorData, "details");
+            details = GetString(errorData, "details");
         }
 
-        return message;
+        var parts = new[]
+            {
+                GetString(error, "title"),
+                GetString(error, "message"),
+                details
+            }
+            .Where(part => !string.IsNullOrWhiteSpace(part))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return parts.Length == 0 ? null : string.Join(" ", parts);
     }
 
     private static bool TryGetFirstError(JsonElement status, out JsonElement error)
@@ -193,6 +213,7 @@ public sealed record ParsedIncomingMessage(
     string? From,
     string? MetaMessageId,
     string? Timestamp,
+    string MetaType,
     string MessageType,
     string? UserText,
     string? InteractiveId,
@@ -203,5 +224,7 @@ public sealed record ParsedStatusEvent(
     string? MetaMessageId,
     string? Status,
     string? RecipientId,
+    string? Timestamp,
     string? ErrorCode,
-    string? ErrorMessage);
+    string? ErrorMessage,
+    string PayloadJson);

@@ -19,7 +19,8 @@ public static class DatabaseInitializer
                 'WhatsAppWebhookEvents',
                 'WhatsAppMessageLogs',
                 'WhatsAppApiSettings',
-                'Customers'
+                'Customers',
+                'CustomerContacts'
             );
             """).ToListAsync(cancellationToken);
 
@@ -32,11 +33,12 @@ public static class DatabaseInitializer
             AND COLUMN_NAME IN (
                 'WhatsAppNumber',
                 'IsWhatsAppVerified',
-                'WhatsAppVerifiedAt'
+                'WhatsAppVerifiedAt',
+                'IsActive'
             );
             """).ToListAsync(cancellationToken);
 
-        var requiredCustomerColumns = new[] { "WhatsAppNumber", "IsWhatsAppVerified", "WhatsAppVerifiedAt" };
+        var requiredCustomerColumns = new[] { "WhatsAppNumber", "IsWhatsAppVerified", "WhatsAppVerifiedAt", "IsActive" };
         var missingCustomerColumns = requiredCustomerColumns
             .Where(column => !customerColumns.Contains(column, StringComparer.OrdinalIgnoreCase))
             .ToArray();
@@ -47,6 +49,46 @@ public static class DatabaseInitializer
                 "Customers table is missing required WhatsApp columns: " +
                 string.Join(", ", missingCustomerColumns) +
                 ". Add these in the main Orchid Prism project before enabling menu replies.");
+        }
+
+        var contactColumns = await db.Database.SqlQueryRaw<string>("""
+            SELECT COLUMN_NAME AS [Value]
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = 'CustomerContacts'
+            AND COLUMN_NAME IN (
+                'CustomerId',
+                'WhatsAppNumber',
+                'IsWhatsAppVerified',
+                'CanSeeRates'
+            );
+            """).ToListAsync(cancellationToken);
+
+        var requiredContactColumns = new[] { "CustomerId", "WhatsAppNumber", "IsWhatsAppVerified", "CanSeeRates" };
+        var missingContactColumns = requiredContactColumns
+            .Where(column => !contactColumns.Contains(column, StringComparer.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (missingContactColumns.Length > 0)
+        {
+            throw new InvalidOperationException(
+                "CustomerContacts table is missing required WhatsApp columns: " +
+                string.Join(", ", missingContactColumns) +
+                ". Add these in the main Orchid Prism project before enabling contact menu replies.");
+        }
+
+        // This service never alters the shared WhatsAppApiSettings table; the column is added by a manual script.
+        var appSecretColumn = await db.Database.SqlQueryRaw<string>("""
+            SELECT COLUMN_NAME AS [Value]
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = 'WhatsAppApiSettings'
+            AND COLUMN_NAME = 'AppSecret';
+            """).ToListAsync(cancellationToken);
+
+        if (appSecretColumn.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "WhatsAppApiSettings.AppSecret column is missing. " +
+                "Run Scripts/whatsapp-app-secret-column.sql against the database, then restart the service.");
         }
 
         await db.Database.ExecuteSqlRawAsync("""
